@@ -1,0 +1,47 @@
+# Tamakkan — Jetson Orin NX runtime requirements
+# Python 3.8, CUDA 11.4, cuDNN 8.6, TensorRT 8.5.2 (JetPack 5.1.3)
+#
+# IMPORTANT: torch and torchvision are NOT installed via pip on Jetson.
+# Install torch from NVIDIA's Jetson wheel:
+#   wget https://developer.download.nvidia.com/compute/redist/jp/v512/pytorch/torch-2.1.0a0+41361538.nv23.06-cp38-cp38-linux_aarch64.whl
+#   pip install torch-2.1.0a0+41361538.nv23.06-cp38-cp38-linux_aarch64.whl
+# Then build torchvision 0.16.2 from source against that torch.
+#
+# Everything below is pip-installable on the Jetson.
+
+# Core
+numpy<2.0
+scipy>=1.4
+pillow>=10.0
+opencv-python>=4.10
+
+# YOLO + tracking
+ultralytics>=8.4
+ultralytics-thop
+
+# OCR
+easyocr>=1.7
+scikit-image
+shapely
+pyclipper
+python-bidi
+
+# Server
+fastapi>=0.124
+uvicorn[standard]>=0.33
+websockets>=13
+python-multipart
+
+# ONNX + TensorRT tooling
+onnx>=1.17
+polygraphy
+pycuda>=2024.1
+
+# Utilities
+pyyaml
+tqdm
+psutil
+matplotlib
+pandas
+seaborn
+polars
