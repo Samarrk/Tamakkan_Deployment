@@ -21,6 +21,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
 
 # Virtual environments
 venv/
@@ -34,6 +35,8 @@ ENV/
 .DS_Store
 Thumbs.db
 *.swp
+*.bak
+*.orig
 
 # ─────────────────────────────────────────
 # Jupyter
@@ -67,6 +70,8 @@ datasets/
 *.jpg
 *.jpeg
 *.png
+*.tar.gz
+*.zip
 
 # Allow images used for documentation
 !docs/**/*.png
@@ -85,10 +90,11 @@ logs/
 test_output*
 
 # ─────────────────────────────────────────
-# Third-party clones (we copy what we need into src/)
+# Frontend (if ever committed here by accident)
 # ─────────────────────────────────────────
-third_party/
-Depth-Anything-V2/
+node_modules/
+.expo/
+*.tsbuildinfo
 
 # ─────────────────────────────────────────
 # Secrets — NEVER commit these
