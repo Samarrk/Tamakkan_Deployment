@@ -10,7 +10,7 @@ we can swap trackers (BoT-SORT, OC-SORT, ...) without touching detectors.
 
 Usage:
     tracker = TamakkanTracker(
-        weights="weights/best.pt",
+        weights="weights/best.pt",          # or "weights/best.engine" on Jetson
         tracker_config="weights/bytetrack_tamakkan.yaml",
     )
     for frame in video_stream:
@@ -19,6 +19,16 @@ Usage:
 """
 
 from __future__ import annotations
+
+# ── TensorRT shim ────────────────────────────────────────────────────────────
+# JetPack 5.1.3 ships TensorRT 8.5 bindings that reference np.bool / np.long,
+# both removed in numpy >= 1.24. Patch them BEFORE any ultralytics import so
+# loading a .engine file doesn't crash. Harmless on PC (np already has bool).
+import numpy as _np
+if not hasattr(_np, "bool"):
+    _np.bool = bool
+if not hasattr(_np, "long"):
+    _np.long = int
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,25 +52,18 @@ class Track:
     class_id: int                                    # 0-6, see TamakkanTracker.CLASS_NAMES
     class_name: str                                  # human-readable class name
     confidence: float                                # detection confidence [0, 1]
-    bbox: tuple[float, float, float, float]          # (x1, y1, x2, y2), sub-pixel
+    bbox: tuple                                      # (x1, y1, x2, y2), sub-pixel
 
     # ── Geometric helpers ───────────────────────────────────────────────
     @property
-    def bbox_int(self) -> tuple[int, int, int, int]:
-        """Bbox rounded to ints, clamped non-negative.
-
-        Use this when slicing arrays (depth maps, image crops) — direct
-        float indexing emits NumPy deprecation warnings and may break in
-        future versions. Negative bbox edges (which can happen with some
-        trackers at frame edges) are clamped to 0.
-        """
+    def bbox_int(self):
+        """Bbox rounded to ints, clamped non-negative."""
         x1, y1, x2, y2 = self.bbox
         return (max(0, int(x1)), max(0, int(y1)),
                 max(0, int(x2)), max(0, int(y2)))
 
     @property
-    def center(self) -> tuple[float, float]:
-        """(cx, cy) — useful for distance / lane-position checks."""
+    def center(self):
         x1, y1, x2, y2 = self.bbox
         return ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
 
@@ -77,8 +80,6 @@ class Track:
         return self.width * self.height
 
     # ── Semantic helpers ────────────────────────────────────────────────
-    # These read class membership in plain English. Downstream code uses
-    # `if track.is_vehicle:` instead of repeating class-id sets everywhere.
     @property
     def is_vehicle(self) -> bool:
         return self.class_id in TamakkanTracker.VEHICLE_CLASSES
@@ -100,12 +101,11 @@ class TamakkanTracker:
     """
     YOLOv11s + ByteTrack wrapper.
 
-    Maintains internal track state across .update() calls — DO NOT create
-    a new instance per frame, you'll lose all track IDs.
-    Create once at session start, call update() per frame.
+    Accepts either a PyTorch .pt weights file OR a TensorRT .engine file.
+    The engine path is auto-detected from the file extension. On Jetson,
+    use .engine for ~2.5x speedup over .pt.
     """
 
-    # Class ID → name. Keep in sync with data.yaml used during training.
     CLASS_NAMES = {
         0: "car",
         1: "truck",
@@ -116,12 +116,10 @@ class TamakkanTracker:
         6: "vulnerable_road_user",
     }
 
-    # ── Semantic class groupings ────────────────────────────────────────
-    # Single source of truth so detector files don't each hardcode their own.
-    VEHICLE_CLASSES = {0, 1, 2}   # car, truck, bus
-    VRU_CLASSES     = {3, 6}      # person, vulnerable_road_user
-    LIGHT_CLASSES   = {4}         # traffic_light
-    SIGN_CLASSES    = {5}         # traffic_sign
+    VEHICLE_CLASSES = {0, 1, 2}
+    VRU_CLASSES     = {3, 6}
+    LIGHT_CLASSES   = {4}
+    SIGN_CLASSES    = {5}
 
     def __init__(
         self,
@@ -130,21 +128,9 @@ class TamakkanTracker:
         conf: float = 0.25,
         iou: float = 0.7,
         imgsz: int = 1280,
-        device: str | None = None,
+        device=None,
         half: bool = True,
     ):
-        """
-        Args:
-            weights: path to YOLOv11s best.pt
-            tracker_config: path to ByteTrack yaml
-            conf: detection confidence threshold (0.25 = F1-optimal for our model)
-            iou: NMS IoU threshold (Ultralytics default)
-            imgsz: inference resolution. 1280 = training resolution, highest
-                   accuracy. Drop to 960 or 640 if pipeline FPS budget is tight.
-            device: 'cuda:0' / 'cpu' / None for auto-detect.
-            half: FP16 inference. Faster on GPU, free accuracy. Auto-disabled
-                  if device='cpu' (FP16 on CPU is slower than FP32).
-        """
         if not Path(weights).exists():
             raise FileNotFoundError(f"Weights not found: {weights}")
         if not Path(tracker_config).exists():
@@ -153,12 +139,22 @@ class TamakkanTracker:
         if device is None:
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-        # FP16 on CPU is actually slower than FP32; auto-correct.
         if device == "cpu" and half:
             half = False
 
-        self.model = YOLO(weights)
+        # Detect TensorRT engine by extension. .engine needs task='detect'
+        # passed explicitly (engine files don't carry the task tag the
+        # .pt files do). Also, engines are already FP16-compiled, so
+        # the `half` flag is a no-op for them.
+        is_engine = Path(weights).suffix.lower() == ".engine"
+
+        if is_engine:
+            self.model = YOLO(weights, task="detect")
+        else:
+            self.model = YOLO(weights)
+
         self.weights_path = weights
+        self.is_engine = is_engine
         self.tracker_config = tracker_config
         self.conf = conf
         self.iou = iou
@@ -167,18 +163,6 @@ class TamakkanTracker:
         self.half = half
 
     def update(self, frame: np.ndarray) -> List[Track]:
-        """
-        Process one frame, return active tracks.
-
-        Args:
-            frame: BGR numpy array (H, W, 3) — standard OpenCV format.
-
-        Returns:
-            All currently-active tracks for this frame. Empty list if
-            nothing detected.
-        """
-        # persist=True is the key flag — Ultralytics needs it to maintain
-        # tracker state across calls. Without it tracking resets every frame.
         results = self.model.track(
             source=frame,
             conf=self.conf,
@@ -192,17 +176,15 @@ class TamakkanTracker:
             stream=False,
         )
 
-        # Ultralytics returns one Results per input; we always pass one frame.
         result = results[0]
 
-        # No detections → empty list (don't return None; consumers iterate).
         if result.boxes is None or result.boxes.id is None:
             return []
 
-        boxes       = result.boxes.xyxy.cpu().numpy()              # (N, 4)
-        track_ids   = result.boxes.id.cpu().numpy().astype(int)    # (N,)
-        class_ids   = result.boxes.cls.cpu().numpy().astype(int)   # (N,)
-        confidences = result.boxes.conf.cpu().numpy()              # (N,)
+        boxes       = result.boxes.xyxy.cpu().numpy()
+        track_ids   = result.boxes.id.cpu().numpy().astype(int)
+        class_ids   = result.boxes.cls.cpu().numpy().astype(int)
+        confidences = result.boxes.conf.cpu().numpy()
 
         return [
             Track(
@@ -219,13 +201,12 @@ class TamakkanTracker:
     def reset(self):
         """
         Clear all tracker state. Call between unrelated video clips or at
-        the start of a new driving session.
-
-        Costs ~1 second (disk read + GPU upload). Never call per-frame.
+        the start of a new driving session. Costs ~1 second.
         """
-        # Ultralytics doesn't expose a clean tracker-state reset, so we
-        # reload the model. We cached the path so we don't need ckpt_path.
-        self.model = YOLO(self.weights_path)
+        if self.is_engine:
+            self.model = YOLO(self.weights_path, task="detect")
+        else:
+            self.model = YOLO(self.weights_path)
 
 
 # ── Standalone smoke test ───────────────────────────────────────────────
@@ -235,7 +216,7 @@ if __name__ == "__main__":
     import cv2
 
     if len(sys.argv) < 2:
-        print("usage: python tracker.py <image_path>")
+        print("usage: python tracker.py <image_path> [weights_path]")
         sys.exit(1)
 
     img = cv2.imread(sys.argv[1])
@@ -243,16 +224,17 @@ if __name__ == "__main__":
         print(f"Could not read image: {sys.argv[1]}")
         sys.exit(1)
 
+    weights = sys.argv[2] if len(sys.argv) >= 3 else "weights/best.pt"
+
     tracker = TamakkanTracker(
-        weights="weights/best.pt",
+        weights=weights,
         tracker_config="weights/bytetrack_tamakkan.yaml",
     )
-    print(f"Tracker initialized on {tracker.device}, half={tracker.half}")
+    print(f"Tracker initialized on {tracker.device}, "
+          f"engine={tracker.is_engine}, half={tracker.half}")
 
-    # Warmup
     _ = tracker.update(img)
 
-    # Time 10 frames
     t0 = time.time()
     for _ in range(10):
         tracks = tracker.update(img)
@@ -261,6 +243,6 @@ if __name__ == "__main__":
 
     print(f"\nDetected {len(tracks)} tracks:")
     for t in tracks:
-        flag = "🚗" if t.is_vehicle else "🚶" if t.is_vru else "🚦" if t.is_traffic_light else "🪧" if t.is_traffic_sign else "?"
+        flag = "[V]" if t.is_vehicle else "[P]" if t.is_vru else "[L]" if t.is_traffic_light else "[S]" if t.is_traffic_sign else "[?]"
         print(f"  {flag} id={t.track_id:>3}  {t.class_name:25s}  "
               f"conf={t.confidence:.3f}  bbox={t.bbox_int}")

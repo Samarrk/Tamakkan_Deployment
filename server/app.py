@@ -579,7 +579,7 @@ def main():
         "source":           args.source,
         "host":              args.host,
         "port":              args.port,
-        "yolo_weights":      str(weights_dir / "best.pt"),
+        "yolo_weights":      str(weights_dir / "best.engine") if (weights_dir / "best.engine").exists() else str(weights_dir / "best.pt"),
         "bytetrack_config":  str(weights_dir / "bytetrack_tamakkan.yaml"),
         "depth_weights":     str(weights_dir / "depth_anything_v2_vits.pth"),
         "lane_weights":      str(weights_dir / "culane_res18_v2.pth"),

@@ -362,7 +362,7 @@ if __name__ == "__main__":
     repo = Path(__file__).resolve().parents[2]
     weights_dir = repo / "weights"
 
-    yolo_w   = str(weights_dir / "best.pt")
+    yolo_w   = str(weights_dir / "best.engine") if (weights_dir / "best.engine").exists() else str(weights_dir / "best.pt")
     bt_cfg   = str(weights_dir / "bytetrack_tamakkan.yaml")
     depth_w  = str(weights_dir / "depth_anything_v2_vits.pth")
     lane_w   = str(weights_dir / "culane_res18_v2.pth")
