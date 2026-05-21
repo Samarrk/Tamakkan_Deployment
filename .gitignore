@@ -105,3 +105,4 @@ node_modules/
 secrets.json
 # TensorRT engine files (Jetson-specific, GPU-tied binaries)
 *.engine
+*.onnx
