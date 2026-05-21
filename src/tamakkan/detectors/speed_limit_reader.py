@@ -66,7 +66,7 @@ from tamakkan.models.tracker import Track
 
 # Minimum OCR confidence for a reading to even be considered as the
 # "candidate" for a new limit. Below this it's discarded as too unreliable.
-CONFIDENCE_MIN_NEW = 0.50
+CONFIDENCE_MIN_NEW = 0.40
 
 # A candidate value must appear in at least this many distinct readings
 # (typically across consecutive frames of the same track) before it's

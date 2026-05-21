@@ -98,8 +98,8 @@ from tamakkan.detectors.speed_limit_reader import SpeedLimitReader
 
 
 # ── Cadence defaults (conservative on depth — see module docstring) ───────────
-DEFAULT_DEPTH_EVERY_N = 5    # depth inference every Nth frame
-DEFAULT_LANES_EVERY_N = 3    # lane inference every Nth frame
+DEFAULT_DEPTH_EVERY_N = 8    # depth inference every Nth frame
+DEFAULT_LANES_EVERY_N = 5    # lane inference every Nth frame
 DEFAULT_OCR_FRAME_SKIP = 1   # speed-limit reader skips frames internally
 
 
