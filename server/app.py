@@ -99,7 +99,7 @@ _CONFIG: Dict[str, Any] = {
     "device":           None,       # None = auto
     "depth_every_n":    8,
     "lanes_every_n":    5,
-    "ocr_frame_skip":   1,
+    "ocr_frame_skip":   999,
     "max_fps":          None,       # if set, sleep between frames to cap
 }
 
