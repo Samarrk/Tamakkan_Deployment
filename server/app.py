@@ -582,7 +582,7 @@ def main():
         "yolo_weights":      str(weights_dir / "best.engine") if (weights_dir / "best.engine").exists() else str(weights_dir / "best.pt"),
         "bytetrack_config":  str(weights_dir / "bytetrack_tamakkan.yaml"),
         "depth_weights":     str(weights_dir / "depth_anything_v2_vits.engine") if (weights_dir / "depth_anything_v2_vits.engine").exists() else str(weights_dir / "depth_anything_v2_vits.pth"),
-        "lane_weights":      str(weights_dir / "culane_res18_v2.pth"),
+        "lane_weights":      str(weights_dir / "culane_res18_v2.engine") if (weights_dir / "culane_res18_v2.engine").exists() else str(weights_dir / "culane_res18_v2.pth"),
         "device":            args.device,
         "depth_every_n":     args.depth_every_n,
         "lanes_every_n":     args.lanes_every_n,

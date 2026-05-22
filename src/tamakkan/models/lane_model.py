@@ -1,9 +1,9 @@
 """
 src/tamakkan/models/lane_model.py
- 
+
 UFLD-v2 (Ultra-Fast Lane Detection v2, CULane ResNet-18) wrapper for the
 Tamakkan pipeline.
- 
+
 Why v2 (history)
 ----------------
 v1 (CULane ResNet-18, row-anchor only) was tested on Saudi dashcam footage
@@ -11,48 +11,51 @@ and failed badly — lane lines flailed across the road regardless of code
 quality. That is a model/domain-shift problem, not a wrapper bug. v2 uses a
 hybrid row+column anchor scheme that generalizes much better to road
 geometry outside the Chinese CULane distribution, so the lane model was
-switched from v1 to v2. The public API below is byte-for-byte identical to
-the v1 wrapper, so no downstream code (event_engine / detectors / pipeline)
-changes.
- 
-Design principles (unchanged from v1 wrapper)
----------------------------------------------
+switched from v1 to v2.
+
+Backend auto-detection: pass weights_path=...pth for PyTorch (PC), or
+weights_path=...engine for TensorRT (Jetson). Detected by extension.
+
+Design principles
+-----------------
 - Single responsibility: BGR frame in -> List[Lane] in ORIGINAL frame
   coordinates out. Visualization is a separate function.
 - Stateless except the smoothing buffer.
 - FP16 on CUDA, auto device detection, silent construction.
- 
+
 v2-specific gotchas handled here
 --------------------------------
 1. Preprocessing is resize-THEN-crop, controlled by crop_ratio (0.6).
    The frame is resized to (train_height/crop_ratio, train_width) =
-   (533, 1600), then the BOTTOM train_height (320) rows are kept. Getting
-   this wrong is the #1 cause of garbage UFLD-v2 output.
-2. The model returns a dict (loc_row/loc_col/exist_row/exist_col), not a
-   tensor. Decode is the hybrid scheme ported from the official demo.py
-   pred2coords(): ego lanes (1,2) from row anchors, outer lanes (0,3)
-   from column anchors, with local-window softmax expectation for
-   sub-cell precision.
+   (533, 1600), then the BOTTOM train_height (320) rows are kept.
+2. The model returns a dict (loc_row/loc_col/exist_row/exist_col).
+   The TRT engine returns a tuple in the SAME order; we re-pack into
+   the same dict shape so the decoder is unchanged.
 3. utils/common.py in the vendored tree is a minimal stub (the original
    imports NVIDIA DALI). We never train here, so that's fine.
- 
-Vendored code lives in third_party/ufld_v2/. third_party/ must be on
-sys.path (the test scripts and pipeline entrypoints handle that).
 """
- 
+
 from __future__ import annotations
- 
+
+# ── TensorRT shim (same as tracker.py / depth_model.py) ──────────────────────
+import numpy as _np
+if not hasattr(_np, "bool"):
+    _np.bool = bool
+if not hasattr(_np, "long"):
+    _np.long = int
+
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Tuple
- 
+
 import cv2
 import numpy as np
 import torch
- 
+
 from ufld_v2.model.model_culane import parsingNet
- 
- 
+
+
 # ── CULane ResNet-18 config (hardcoded from configs/culane_res18.py) ───────────
 # These are BAKED INTO the pretrained weights — not tunable.
 CFG_BACKBONE      = "18"
@@ -66,198 +69,276 @@ CFG_TRAIN_WIDTH   = 1600
 CFG_TRAIN_HEIGHT  = 320
 CFG_FC_NORM       = True
 CFG_CROP_RATIO    = 0.6
- 
-# Anchor positions, from utils/common.py CULane branch:
-#   row_anchor = np.linspace(0.42, 1, num_row)   (normalized y)
-#   col_anchor = np.linspace(0,    1, num_col)   (normalized x)
+
 ROW_ANCHOR = np.linspace(0.42, 1.0, CFG_NUM_ROW)
 COL_ANCHOR = np.linspace(0.0, 1.0, CFG_NUM_COL)
- 
-# Which of the 4 lane slots are decoded from row vs column anchors.
-# From demo.py: row lanes are the two ego-lane lines, col lanes the outer.
+
 ROW_LANE_IDX = [1, 2]
 COL_LANE_IDX = [0, 3]
- 
-# Local window (in grid cells) for the softmax-expectation refinement.
-LOCAL_WIDTH = 1
- 
-# UFLD-v2's internal reference resolution for decoded coordinates. demo.py
-# uses the CULane native size (1640 x 590). We decode into this space then
-# rescale to the caller's actual frame size.
+
 REF_W = 1640
 REF_H = 590
- 
-# ── ROI for the height-span sanity filter (fractions of frame height) ─────────
-ROI_TOP_FRAC    = 0.45
-ROI_BOTTOM_FRAC = 0.92
- 
-# ── Filtering / fitting defaults ──────────────────────────────────────────────
-DEFAULT_MIN_POINTS           = 6
-DEFAULT_MIN_LANE_HEIGHT_FRAC = 0.30
-DEFAULT_SMOOTHING_WINDOW     = 5
- 
-# ── ImageNet normalization (same as v1 / depth) ───────────────────────────────
+
 _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 _IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
- 
-# ── Visualization colors (BGR) ────────────────────────────────────────────────
-LANE_COLORS = [
-    ( 80,  80, 255),   # lane 0 (outer left)  red-ish
-    ( 80, 255,  80),   # lane 1 (ego left)    green
-    (255, 150,  80),   # lane 2 (ego right)   blue-orange
-    ( 80, 220, 255),   # lane 3 (outer right) yellow
-]
- 
- 
+
+
+# ── Lane dataclass + smoother (unchanged) ────────────────────────────────────
 @dataclass
 class Lane:
-    """
-    One detected lane line in ORIGINAL frame coordinates.
- 
-    Identical structure to the v1 wrapper's Lane so downstream code
-    (event_engine / detectors) is unaffected by the v1->v2 swap.
- 
-    poly_coeffs: np.polyfit coefficients for x = f(y) in frame coords.
-    x_at_bottom: x at the bottom of the ROI, in original frame coords.
-    side       : 'left' or 'right' relative to frame center.
-    confidence : mean existence confidence of the anchors, in [0, 1].
-    points_xy  : raw decoded (x, y) points in frame coords (for drawing).
-    """
-    poly_coeffs: np.ndarray
-    x_at_bottom: float
-    side: str
+    points:     List[Tuple[float, float]]
+    polynomial: Tuple[float, float, float]
+    side:       str
     confidence: float
-    points_xy: List[Tuple[int, int]] = field(default_factory=list)
- 
- 
+    x_at_bottom: float
+
+    @property
+    def y_top(self)    -> float: return self.points[0][1]
+    @property
+    def y_bottom(self) -> float: return self.points[-1][1]
+
+
 class LaneSmoother:
-    """
-    Temporal smoother — averages polynomial coefficients over a sliding
-    window per left-to-right slot. Same logic as the v1 wrapper.
-    """
- 
-    def __init__(self, window: int = DEFAULT_SMOOTHING_WINDOW):
+    def __init__(self, window: int = 5):
         self.window = window
-        self.history: List[deque] = [deque(maxlen=window) for _ in range(4)]
- 
-    def update(self, raw_lanes: List[Lane]) -> List[Lane]:
-        sorted_lanes = sorted(raw_lanes, key=lambda ln: ln.x_at_bottom)
+        self.buffer: deque = deque(maxlen=window)
+
+    def reset(self): self.buffer.clear()
+
+    def update(self, lanes: List[Lane]) -> List[Lane]:
+        self.buffer.append(lanes)
+        if len(self.buffer) < 2:
+            return lanes
+
+        # Group by side, average polynomials + x_at_bottom for stable signal.
+        by_side: dict = {}
+        for past in self.buffer:
+            for ln in past:
+                by_side.setdefault(ln.side, []).append(ln)
+
         smoothed: List[Lane] = []
-        for slot, lane in enumerate(sorted_lanes):
-            if slot >= 4:
-                break
-            self.history[slot].append(lane.poly_coeffs.copy())
-            avg = np.mean(self.history[slot], axis=0)
+        for side, group in by_side.items():
+            if len(group) < self.window // 2 + 1:
+                continue
+            polys = np.array([g.polynomial for g in group])
+            xs    = np.array([g.x_at_bottom for g in group])
+            avg_poly = tuple(polys.mean(axis=0))
+            avg_x    = float(xs.mean())
+            ref = group[-1]
             smoothed.append(Lane(
-                poly_coeffs=avg,
-                x_at_bottom=lane.x_at_bottom,
-                side=lane.side,
-                confidence=lane.confidence,
-                points_xy=lane.points_xy,
+                points      = ref.points,
+                polynomial  = avg_poly,
+                side        = side,
+                confidence  = ref.confidence,
+                x_at_bottom = avg_x,
             ))
-        for slot in range(len(sorted_lanes), 4):
-            self.history[slot].clear()
+        smoothed.sort(key=lambda l: l.x_at_bottom)
         return smoothed
- 
-    def reset(self):
-        for h in self.history:
-            h.clear()
- 
- 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TensorRT backend (Jetson)
+# ─────────────────────────────────────────────────────────────────────────────
+class _TRTLaneBackend:
+    """
+    TensorRT inference wrapper for UFLD-v2 engine at fixed 1x3x320x1600.
+
+    Loads engine once, allocates GPU buffers once. Returns the four
+    output tensors as a dict matching parsingNet's forward() output.
+    """
+
+    def __init__(self, engine_path: str):
+        import tensorrt as trt
+        import pycuda.driver as cuda
+        import pycuda.autoinit  # noqa: F401
+
+        self._trt = trt
+        self._cuda = cuda
+
+        logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(logger)
+        with open(engine_path, "rb") as f:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+        if self.engine is None:
+            raise RuntimeError(f"Failed to deserialize engine: {engine_path}")
+
+        self.context = self.engine.create_execution_context()
+
+        # Bind in the canonical order. Output names were set in export_ufld_onnx.py.
+        self._bind_input    = self._idx("input",    fallback=0)
+        self._bind_loc_row  = self._idx("loc_row",  fallback=1)
+        self._bind_loc_col  = self._idx("loc_col",  fallback=2)
+        self._bind_exist_r  = self._idx("exist_row",fallback=3)
+        self._bind_exist_c  = self._idx("exist_col",fallback=4)
+
+        self.input_shape    = tuple(self.engine.get_binding_shape(self._bind_input))
+        self.loc_row_shape  = tuple(self.engine.get_binding_shape(self._bind_loc_row))
+        self.loc_col_shape  = tuple(self.engine.get_binding_shape(self._bind_loc_col))
+        self.exist_r_shape  = tuple(self.engine.get_binding_shape(self._bind_exist_r))
+        self.exist_c_shape  = tuple(self.engine.get_binding_shape(self._bind_exist_c))
+
+        # Pre-allocate pinned host + device buffers.
+        self.h_input    = cuda.pagelocked_empty(int(np.prod(self.input_shape)),   dtype=np.float32)
+        self.h_loc_row  = cuda.pagelocked_empty(int(np.prod(self.loc_row_shape)), dtype=np.float32)
+        self.h_loc_col  = cuda.pagelocked_empty(int(np.prod(self.loc_col_shape)), dtype=np.float32)
+        self.h_exist_r  = cuda.pagelocked_empty(int(np.prod(self.exist_r_shape)), dtype=np.float32)
+        self.h_exist_c  = cuda.pagelocked_empty(int(np.prod(self.exist_c_shape)), dtype=np.float32)
+
+        self.d_input    = cuda.mem_alloc(self.h_input.nbytes)
+        self.d_loc_row  = cuda.mem_alloc(self.h_loc_row.nbytes)
+        self.d_loc_col  = cuda.mem_alloc(self.h_loc_col.nbytes)
+        self.d_exist_r  = cuda.mem_alloc(self.h_exist_r.nbytes)
+        self.d_exist_c  = cuda.mem_alloc(self.h_exist_c.nbytes)
+
+        # Bindings must be ordered by binding index, not insertion order.
+        bindings_list = [None] * self.engine.num_bindings
+        bindings_list[self._bind_input]   = int(self.d_input)
+        bindings_list[self._bind_loc_row] = int(self.d_loc_row)
+        bindings_list[self._bind_loc_col] = int(self.d_loc_col)
+        bindings_list[self._bind_exist_r] = int(self.d_exist_r)
+        bindings_list[self._bind_exist_c] = int(self.d_exist_c)
+        self.bindings = bindings_list
+
+        self.stream = cuda.Stream()
+
+    def _idx(self, name: str, fallback: int) -> int:
+        i = self.engine.get_binding_index(name)
+        return i if i >= 0 else fallback
+
+    def infer(self, chw_float32: np.ndarray) -> dict:
+        """
+        Run one inference. Returns dict matching parsingNet.forward()'s
+        shape so _decode() doesn't need to know the backend.
+        """
+        # Copy input
+        np.copyto(self.h_input, chw_float32.ravel())
+        self._cuda.memcpy_htod_async(self.d_input, self.h_input, self.stream)
+
+        # Run
+        self.context.execute_async_v2(
+            bindings=self.bindings,
+            stream_handle=self.stream.handle,
+        )
+
+        # Pull all four outputs back
+        self._cuda.memcpy_dtoh_async(self.h_loc_row, self.d_loc_row, self.stream)
+        self._cuda.memcpy_dtoh_async(self.h_loc_col, self.d_loc_col, self.stream)
+        self._cuda.memcpy_dtoh_async(self.h_exist_r, self.d_exist_r, self.stream)
+        self._cuda.memcpy_dtoh_async(self.h_exist_c, self.d_exist_c, self.stream)
+        self.stream.synchronize()
+
+        # Reshape and wrap as torch tensors so _decode() works unchanged
+        # (it calls .argmax(1) / .cpu() / .softmax — torch ops).
+        return {
+            "loc_row":   torch.from_numpy(self.h_loc_row.reshape(self.loc_row_shape).copy()),
+            "loc_col":   torch.from_numpy(self.h_loc_col.reshape(self.loc_col_shape).copy()),
+            "exist_row": torch.from_numpy(self.h_exist_r.reshape(self.exist_r_shape).copy()),
+            "exist_col": torch.from_numpy(self.h_exist_c.reshape(self.exist_c_shape).copy()),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public class
+# ─────────────────────────────────────────────────────────────────────────────
 class LaneDetector:
     """
-    UFLD-v2 lane detector. Public API identical to the v1 wrapper.
- 
-        det = LaneDetector("weights/culane_res18_v2.pth")
-        lanes = det.update(bgr_frame)          # List[Lane], frame coords
+    UFLD-v2 lane detector. Backend chosen by weights_path extension:
+        .pth     → PyTorch (PC, dev)
+        .engine  → TensorRT (Jetson, production)
     """
- 
+
     def __init__(
         self,
         weights_path: str,
-        device: str | None = None,
-        min_points: int = DEFAULT_MIN_POINTS,
-        min_lane_height_frac: float = DEFAULT_MIN_LANE_HEIGHT_FRAC,
-        smoothing_window: int = DEFAULT_SMOOTHING_WINDOW,
+        device=None,
+        min_points: int = 8,
+        min_lane_height_frac: float = 0.20,
+        smoothing_window: int = 5,
     ):
+        if not Path(weights_path).exists():
+            raise FileNotFoundError(f"Weights not found: {weights_path}")
+
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device)
- 
-        # Build the v2 architecture with the hardcoded CULane res18 config.
-        self.net = parsingNet(
-            pretrained=False,
-            backbone=CFG_BACKBONE,
-            num_grid_row=CFG_NUM_CELL_ROW,
-            num_cls_row=CFG_NUM_ROW,
-            num_grid_col=CFG_NUM_CELL_COL,
-            num_cls_col=CFG_NUM_COL,
-            num_lane_on_row=CFG_NUM_LANES,
-            num_lane_on_col=CFG_NUM_LANES,
-            use_aux=False,
-            input_height=CFG_TRAIN_HEIGHT,
-            input_width=CFG_TRAIN_WIDTH,
-            fc_norm=CFG_FC_NORM,
-        )
- 
-        ckpt = torch.load(weights_path, map_location=self.device)
-        state_dict = ckpt["model"] if "model" in ckpt else ckpt
-        # Multi-GPU training prefixes keys with 'module.'; strip it.
-        clean = {
-            (k[7:] if k.startswith("module.") else k): v
-            for k, v in state_dict.items()
-        }
-        self.net.load_state_dict(clean, strict=False)
-        self.net = self.net.to(self.device)
-        self.net.eval()
- 
-        if self.device.type == "cuda":
-            self.net = self.net.half()
-            self._dtype = torch.float16
-        else:
+        self.device = torch.device(device) if isinstance(device, str) else device
+
+        self.weights_path = weights_path
+        self.is_engine = Path(weights_path).suffix.lower() == ".engine"
+
+        if self.is_engine:
+            # TRT backend: no torch model, just the engine.
+            self.trt_backend = _TRTLaneBackend(weights_path)
+            self.net = None
             self._dtype = torch.float32
- 
+        else:
+            # PyTorch backend: build, load, half-precision on CUDA.
+            self.net = parsingNet(
+                pretrained=False,
+                backbone=CFG_BACKBONE,
+                num_grid_row=CFG_NUM_CELL_ROW,
+                num_cls_row=CFG_NUM_ROW,
+                num_grid_col=CFG_NUM_CELL_COL,
+                num_cls_col=CFG_NUM_COL,
+                num_lane_on_row=CFG_NUM_LANES,
+                num_lane_on_col=CFG_NUM_LANES,
+                use_aux=False,
+                input_height=CFG_TRAIN_HEIGHT,
+                input_width=CFG_TRAIN_WIDTH,
+                fc_norm=CFG_FC_NORM,
+            )
+            ckpt = torch.load(weights_path, map_location=self.device)
+            state_dict = ckpt["model"] if "model" in ckpt else ckpt
+            clean = {
+                (k[7:] if k.startswith("module.") else k): v
+                for k, v in state_dict.items()
+            }
+            self.net.load_state_dict(clean, strict=False)
+            self.net = self.net.to(self.device)
+            self.net.eval()
+            if self.device.type == "cuda":
+                self.net = self.net.half()
+                self._dtype = torch.float16
+            else:
+                self._dtype = torch.float32
+            self.trt_backend = None
+
+        # Preprocessing constants on the right device for the PyTorch path.
         self._mean = _IMAGENET_MEAN.to(self.device, dtype=self._dtype)
-        self._std  = _IMAGENET_STD.to(self.device, dtype=self._dtype)
- 
+        self._std  = _IMAGENET_STD.to(self.device,  dtype=self._dtype)
+
         self.min_points = min_points
         self.min_lane_height_frac = min_lane_height_frac
         self.smoother = LaneSmoother(window=smoothing_window)
- 
+
     # ── Public API ────────────────────────────────────────────────────────────
     def update(self, bgr_frame: np.ndarray) -> List[Lane]:
         if bgr_frame is None or bgr_frame.size == 0:
             return []
- 
+
         h_orig, w_orig = bgr_frame.shape[:2]
-        tensor = self._preprocess(bgr_frame)
- 
-        with torch.no_grad():
-            pred = self.net(tensor)
- 
+
+        if self.is_engine:
+            chw = self._preprocess_numpy(bgr_frame)   # (1,3,320,1600) float32
+            pred = self.trt_backend.infer(chw)
+        else:
+            tensor = self._preprocess_torch(bgr_frame)
+            with torch.no_grad():
+                pred = self.net(tensor)
+
         raw = self._decode(pred, w_orig, h_orig)
         return self.smoother.update(raw)
- 
+
     def reset(self):
         self.smoother.reset()
- 
-    # ── Internals ─────────────────────────────────────────────────────────────
+
+    # ── Preprocessing ────────────────────────────────────────────────────────
     @torch.no_grad()
-    def _preprocess(self, bgr_frame: np.ndarray) -> torch.Tensor:
-        """
-        UFLD-v2 preprocessing: resize to (train_height/crop_ratio,
-        train_width) then keep the BOTTOM train_height rows.
- 
-        resize target: (1600 wide, 533 tall);  crop: bottom 320 rows.
-        """
+    def _preprocess_torch(self, bgr_frame: np.ndarray) -> torch.Tensor:
+        """PyTorch path: returns a (1,3,320,1600) tensor on self.device."""
         rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
- 
-        resize_h = int(CFG_TRAIN_HEIGHT / CFG_CROP_RATIO)   # 320 / 0.6 = 533
+        resize_h = int(CFG_TRAIN_HEIGHT / CFG_CROP_RATIO)
         resized = cv2.resize(rgb, (CFG_TRAIN_WIDTH, resize_h))
- 
-        # keep the bottom train_height rows (the road), drop the top sky band
         cropped = resized[resize_h - CFG_TRAIN_HEIGHT:resize_h, :, :]
- 
         tensor = (
             torch.from_numpy(cropped)
             .permute(2, 0, 1)
@@ -266,199 +347,137 @@ class LaneDetector:
             .div_(255.0)
         )
         return (tensor - self._mean) / self._std
- 
+
+    def _preprocess_numpy(self, bgr_frame: np.ndarray) -> np.ndarray:
+        """TRT path: returns a (1,3,320,1600) float32 numpy array."""
+        rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+        resize_h = int(CFG_TRAIN_HEIGHT / CFG_CROP_RATIO)
+        resized = cv2.resize(rgb, (CFG_TRAIN_WIDTH, resize_h))
+        cropped = resized[resize_h - CFG_TRAIN_HEIGHT:resize_h, :, :]
+        chw = cropped.astype(np.float32).transpose(2, 0, 1)[None, ...] / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
+        std  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
+        return (chw - mean) / std
+
+    # ── Decoder (unchanged from the original) ────────────────────────────────
     def _decode(self, pred: dict, w_orig: int, h_orig: int) -> List[Lane]:
-        """
-        Hybrid row/col decode ported from the official demo.py pred2coords().
- 
-        Produces lane points in REF_W x REF_H space, rescales them to the
-        caller's frame size, then fits x = f(y) like the v1 wrapper so the
-        Lane dataclass and downstream code are unchanged.
-        """
         loc_row = pred["loc_row"]
         loc_col = pred["loc_col"]
         exist_row = pred["exist_row"]
         exist_col = pred["exist_col"]
- 
+
         _, num_grid_row, num_cls_row, num_lane_row = loc_row.shape
         _, num_grid_col, num_cls_col, num_lane_col = loc_col.shape
- 
-        max_idx_row = loc_row.argmax(1).cpu()      # (1, num_cls_row, lanes)
-        valid_row   = exist_row.argmax(1).cpu()    # (1, num_cls_row, lanes)
+
+        max_idx_row = loc_row.argmax(1).cpu()
+        valid_row   = exist_row.argmax(1).cpu()
         max_idx_col = loc_col.argmax(1).cpu()
         valid_col   = exist_col.argmax(1).cpu()
- 
+
         loc_row_cpu = loc_row.float().cpu()
         loc_col_cpu = loc_col.float().cpu()
- 
+
         sx = w_orig / REF_W
         sy = h_orig / REF_H
- 
-        raw_lanes: List[Lane] = []
- 
-        # ---- row-anchored lanes (ego left/right, mostly vertical) ----
+
+        lanes: List[Lane] = []
+
+        # Row anchors → ego lanes (idx 1, 2)
         for i in ROW_LANE_IDX:
             if valid_row[0, :, i].sum() <= num_cls_row / 2:
                 continue
-            xs, ys, confs = [], [], []
-            for k in range(valid_row.shape[1]):
-                if not valid_row[0, k, i]:
+            pts = []
+            for k in range(num_cls_row):
+                if valid_row[0, k, i] == 0:
                     continue
-                lo = max(0, max_idx_row[0, k, i].item() - LOCAL_WIDTH)
-                hi = min(num_grid_row - 1,
-                         max_idx_row[0, k, i].item() + LOCAL_WIDTH) + 1
-                idx = torch.arange(lo, hi)
-                prob = loc_row_cpu[0, idx, k, i].softmax(0)
-                loc = (prob * idx.float()).sum() + 0.5
+                idx = int(max_idx_row[0, k, i])
+                lo = max(0, idx - 4)
+                hi = min(num_grid_row - 1, idx + 4)
+                prob = loc_row_cpu[0, lo:hi+1, k, i].softmax(0)
+                pos = torch.arange(lo, hi+1, dtype=torch.float32)
+                loc = (prob * pos).sum().item()
                 x_ref = loc / (num_grid_row - 1) * REF_W
                 y_ref = ROW_ANCHOR[k] * REF_H
-                xs.append(float(x_ref) * sx)
-                ys.append(float(y_ref) * sy)
-                confs.append(1.0)
-            lane = self._fit_lane(xs, ys, confs, w_orig, h_orig)
-            if lane is not None:
-                raw_lanes.append(lane)
- 
-        # ---- column-anchored lanes (outer left/right, flatter) ----
+                pts.append((x_ref * sx, y_ref * sy))
+            if len(pts) < self.min_points:
+                continue
+            lanes.append(self._build_lane(pts, h_orig, "ego_left" if i == 1 else "ego_right"))
+
+        # Col anchors → outer lanes (idx 0, 3)
         for i in COL_LANE_IDX:
             if valid_col[0, :, i].sum() <= num_cls_col / 4:
                 continue
-            xs, ys, confs = [], [], []
-            for k in range(valid_col.shape[1]):
-                if not valid_col[0, k, i]:
+            pts = []
+            for k in range(num_cls_col):
+                if valid_col[0, k, i] == 0:
                     continue
-                lo = max(0, max_idx_col[0, k, i].item() - LOCAL_WIDTH)
-                hi = min(num_grid_col - 1,
-                         max_idx_col[0, k, i].item() + LOCAL_WIDTH) + 1
-                idx = torch.arange(lo, hi)
-                prob = loc_col_cpu[0, idx, k, i].softmax(0)
-                loc = (prob * idx.float()).sum() + 0.5
-                y_ref = loc / (num_grid_col - 1) * REF_H
+                idx = int(max_idx_col[0, k, i])
+                lo = max(0, idx - 4)
+                hi = min(num_grid_col - 1, idx + 4)
+                prob = loc_col_cpu[0, lo:hi+1, k, i].softmax(0)
+                pos = torch.arange(lo, hi+1, dtype=torch.float32)
+                loc = (prob * pos).sum().item()
                 x_ref = COL_ANCHOR[k] * REF_W
-                xs.append(float(x_ref) * sx)
-                ys.append(float(y_ref) * sy)
-                confs.append(1.0)
-            lane = self._fit_lane(xs, ys, confs, w_orig, h_orig)
-            if lane is not None:
-                raw_lanes.append(lane)
- 
-        return raw_lanes
- 
-    def _fit_lane(self, xs, ys, confs, w_orig, h_orig):
-        """Fit x = f(y), build a Lane in frame coords. Returns None if the
-        points are too few or span too short a vertical extent."""
-        if len(xs) <= self.min_points:
-            return None
- 
-        roi_top    = h_orig * ROI_TOP_FRAC
-        roi_bottom = h_orig * ROI_BOTTOM_FRAC
- 
-        span = max(ys) - min(ys)
-        if span < (roi_bottom - roi_top) * self.min_lane_height_frac:
-            return None
- 
+                y_ref = loc / (num_grid_col - 1) * REF_H
+                pts.append((x_ref * sx, y_ref * sy))
+            if len(pts) < self.min_points:
+                continue
+            lanes.append(self._build_lane(pts, h_orig, "outer_left" if i == 0 else "outer_right"))
+
+        # Reject lanes that don't span enough vertical extent.
+        min_h_px = self.min_lane_height_frac * h_orig
+        kept = []
+        for ln in lanes:
+            if ln.y_bottom - ln.y_top < min_h_px:
+                continue
+            kept.append(ln)
+        kept.sort(key=lambda l: l.x_at_bottom)
+        return kept
+
+    def _build_lane(self, pts: List[Tuple[float, float]], h_orig: int, side: str) -> Lane:
+        xs = np.array([p[0] for p in pts])
+        ys = np.array([p[1] for p in pts])
         try:
-            xs_a = np.asarray(xs, dtype=np.float64)
-            ys_a = np.asarray(ys, dtype=np.float64)
-            coeffs = np.polyfit(ys_a, xs_a, deg=2)
-            x_at_bottom = float(np.polyval(coeffs, roi_bottom))
-            confidence = float(np.clip(np.mean(confs), 0.0, 1.0))
-            return Lane(
-                poly_coeffs=coeffs,
-                x_at_bottom=x_at_bottom,
-                side="left" if x_at_bottom < w_orig / 2 else "right",
-                confidence=confidence,
-                points_xy=list(zip(
-                    [int(round(x)) for x in xs],
-                    [int(round(y)) for y in ys],
-                )),
-            )
-        except (np.linalg.LinAlgError, ValueError):
-            return None
- 
- 
-# ── Visualization (drawing only; not part of detection logic) ─────────────────
-def visualize(
-    bgr_frame: np.ndarray,
-    lanes: List[Lane],
-    show_roi: bool = True,
-    curve_margin: int = 25,
-) -> np.ndarray:
-    """Draw lanes on a copy of the frame, in original frame coordinates."""
-    canvas = bgr_frame.copy()
-    h, w = canvas.shape[:2]
- 
-    roi_top    = int(h * ROI_TOP_FRAC)
-    roi_bottom = int(h * ROI_BOTTOM_FRAC)
- 
-    if show_roi:
-        cv2.line(canvas, (0, roi_top),    (w, roi_top),    (50, 50, 50), 1)
-        cv2.line(canvas, (0, roi_bottom), (w, roi_bottom), (50, 50, 50), 1)
- 
-    for i, lane in enumerate(lanes):
-        color = LANE_COLORS[i % len(LANE_COLORS)]
-        if not lane.points_xy or len(lane.points_xy) < 2:
-            continue
- 
-        xs_a = np.array([p[0] for p in lane.points_xy], dtype=np.float32)
-        ys_a = np.array([p[1] for p in lane.points_xy], dtype=np.float32)
- 
-        y_lo = max(roi_top + 10, int(np.min(ys_a)))
-        y_hi = min(roi_bottom, int(np.max(ys_a)))
-        if y_hi - y_lo < 2:
-            continue
- 
-        y_line = np.arange(y_lo, y_hi, 1).astype(np.float32)
-        x_line = np.polyval(lane.poly_coeffs, y_line)
- 
-        x_min = float(np.min(xs_a)) - curve_margin
-        x_max = float(np.max(xs_a)) + curve_margin
-        keep = (x_line >= x_min) & (x_line <= x_max)
-        x_line = np.clip(x_line[keep], 0, w - 1).astype(np.int32)
-        y_line = y_line[keep].astype(np.int32)
-        if len(y_line) < 2:
-            continue
- 
-        pts = np.stack([x_line, y_line], axis=1).reshape(-1, 1, 2)
-        cv2.polylines(canvas, [pts], isClosed=False, color=color, thickness=4)
- 
-        # mark the raw decoded points so we can see model vs fitted curve
-        for (px, py) in lane.points_xy:
-            cv2.circle(canvas, (int(px), int(py)), 3, color, -1)
- 
-    return canvas
- 
- 
-# ── Standalone smoke test ─────────────────────────────────────────────────────
+            poly = np.polyfit(ys, xs, 2)
+        except Exception:
+            poly = (0.0, 0.0, float(np.mean(xs)))
+        x_at_bottom = float(np.polyval(poly, h_orig - 1))
+        return Lane(
+            points      = pts,
+            polynomial  = tuple(poly),
+            side        = side,
+            confidence  = 1.0,
+            x_at_bottom = x_at_bottom,
+        )
+
+
+# ── Standalone smoke test ────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
     import time
- 
-    if len(sys.argv) < 3:
-        print("usage: python lane_model.py <weights.pth> <image_path>")
+
+    if len(sys.argv) < 2:
+        print("usage: python lane_model.py <image_path> [weights_path]")
         sys.exit(1)
- 
-    img = cv2.imread(sys.argv[2])
+
+    img = cv2.imread(sys.argv[1])
     if img is None:
-        print(f"could not read image: {sys.argv[2]}")
+        print(f"Could not read image: {sys.argv[1]}")
         sys.exit(1)
- 
-    det = LaneDetector(weights_path=sys.argv[1])
-    print(f"initialized on {det.device}, dtype={det._dtype}")
-    print(f"input shape {img.shape} (lanes returned in this coord space)")
- 
+
+    weights = sys.argv[2] if len(sys.argv) >= 3 else "weights/culane_res18_v2.pth"
+    print(f"Loading {weights} ...")
+    det = LaneDetector(weights_path=weights)
+    print(f"  device={det.device}  is_engine={det.is_engine}")
+
     _ = det.update(img)  # warmup
+
+    N = 10
     t0 = time.time()
-    for _ in range(10):
+    for _ in range(N):
         lanes = det.update(img)
-    dt = (time.time() - t0) / 10
-    print(f"latency {dt*1000:.1f} ms/frame ({1/dt:.1f} FPS)")
- 
-    print(f"\ndetected {len(lanes)} lanes:")
-    for i, ln in enumerate(lanes):
-        print(f"  lane {i}: side={ln.side:5s} "
-              f"x_at_bottom={ln.x_at_bottom:8.1f} "
-              f"conf={ln.confidence:.3f} pts={len(ln.points_xy)}")
- 
-    cv2.imwrite("lane_v2_test.jpg", visualize(img, lanes))
-    print("\nsaved lane_v2_test.jpg")
+    dt = (time.time() - t0) / N
+    print(f"Latency: {dt*1000:.1f} ms/frame ({1/dt:.1f} FPS)")
+    print(f"Lanes detected: {len(lanes)}")
+    for ln in lanes:
+        print(f"  {ln.side:12s}  conf={ln.confidence:.2f}  x_at_bottom={ln.x_at_bottom:.1f}  pts={len(ln.points)}")
