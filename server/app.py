@@ -553,9 +553,9 @@ def _build_argparser() -> argparse.ArgumentParser:
         help=f"Directory with model weights. Default: {_default_weights_dir()}",
     )
     p.add_argument("--device", default=None, help="cuda:0 / cpu / None (auto)")
-    p.add_argument("--depth-every-n", type=int, default=5)
-    p.add_argument("--lanes-every-n", type=int, default=3)
-    p.add_argument("--ocr-frame-skip", type=int, default=1)
+    p.add_argument("--depth-every-n", type=int, default=8)
+    p.add_argument("--lanes-every-n", type=int, default=5)
+    p.add_argument("--ocr-frame-skip", type=int, default=999)
     p.add_argument(
         "--max-fps",
         type=float,

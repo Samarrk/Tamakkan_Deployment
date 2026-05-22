@@ -1,0 +1,27 @@
+[Unit]
+Description=Tamakkan Driver Assistance Backend (FastAPI + WebSocket)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=samarrk
+Group=samarrk
+WorkingDirectory=/home/samarrk/tamakkan/repo
+Environment="PYTHONPATH=/home/samarrk/tamakkan/repo/src:/home/samarrk/tamakkan/repo/third_party"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/samarrk/tamakkan/venv/bin/python -m server.app --source 0 --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Give it 90s to start up (model loads + TRT engine deserialization take time)
+TimeoutStartSec=90
+
+# Don't restart more than 5 times per minute (prevents tight crash loops)
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Install]
+WantedBy=multi-user.target
