@@ -63,10 +63,16 @@ class _TRTDepthBackend:
         # Lazy imports — only Jetson needs these.
         import tensorrt as trt
         import pycuda.driver as cuda
-        import pycuda.autoinit  # noqa: F401  -- initializes CUDA context
-
+        cuda.init()
+        # Use the primary CUDA context. This context can be pushed onto
+        # any thread, unlike pycuda.autoinit which binds to the import
+        # thread. Required for FastAPI/uvicorn worker threads.
         self._trt = trt
         self._cuda = cuda
+        device = cuda.Device(0)
+        self._cuda_ctx = device.retain_primary_context()
+        # Initial push so the rest of __init__ (buffer alloc) runs in context.
+        self._cuda_ctx.push()
 
         # Load engine.
         logger = trt.Logger(trt.Logger.WARNING)
@@ -102,19 +108,21 @@ class _TRTDepthBackend:
         self.bindings = [int(self.d_input), int(self.d_output)]
 
         self.stream = cuda.Stream()
+        # Pop the init-time context push; infer() will push/pop per call.
+        self._cuda_ctx.pop()
 
     def infer(self, chw_float32: np.ndarray) -> np.ndarray:
         """
-        Run one inference.
-
-        Args:
-            chw_float32: preprocessed input, shape (1, 3, 518, 518), float32,
-                         already normalized.
-
-        Returns:
-            float32 depth map of shape (518, 518) — raw model output.
+        Run one inference. May be called from any thread; CUDA context
+        is pushed/popped per call.
         """
-        # Copy input → pinned host buffer → device.
+        self._cuda_ctx.push()
+        try:
+            return self._infer_inner(chw_float32)
+        finally:
+            self._cuda_ctx.pop()
+
+    def _infer_inner(self, chw_float32: np.ndarray) -> np.ndarray:
         np.copyto(self.h_input, chw_float32.ravel())
         self._cuda.memcpy_htod_async(self.d_input, self.h_input, self.stream)
 

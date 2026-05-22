@@ -150,10 +150,16 @@ class _TRTLaneBackend:
     def __init__(self, engine_path: str):
         import tensorrt as trt
         import pycuda.driver as cuda
-        import pycuda.autoinit  # noqa: F401
-
+        cuda.init()
+        # Use the primary CUDA context — can be pushed onto any thread,
+        # unlike pycuda.autoinit which binds to the import thread.
+        # Required for FastAPI/uvicorn worker threads.
         self._trt = trt
         self._cuda = cuda
+        device = cuda.Device(0)
+        self._cuda_ctx = device.retain_primary_context()
+        # Push so the rest of __init__ (buffer allocation) runs in context.
+        self._cuda_ctx.push()
 
         logger = trt.Logger(trt.Logger.WARNING)
         runtime = trt.Runtime(logger)
@@ -200,6 +206,8 @@ class _TRTLaneBackend:
         self.bindings = bindings_list
 
         self.stream = cuda.Stream()
+        # Pop the init-time context push; infer() will push/pop per call.
+        self._cuda_ctx.pop()
 
     def _idx(self, name: str, fallback: int) -> int:
         i = self.engine.get_binding_index(name)
@@ -207,10 +215,17 @@ class _TRTLaneBackend:
 
     def infer(self, chw_float32: np.ndarray) -> dict:
         """
-        Run one inference. Returns dict matching parsingNet.forward()'s
-        shape so _decode() doesn't need to know the backend.
+        Run one inference. May be called from any thread; CUDA context
+        is pushed/popped per call. Returns dict matching parsingNet
+        forward() shape so _decode() doesn't need to know the backend.
         """
-        # Copy input
+        self._cuda_ctx.push()
+        try:
+            return self._infer_inner(chw_float32)
+        finally:
+            self._cuda_ctx.pop()
+
+    def _infer_inner(self, chw_float32: np.ndarray) -> dict:
         np.copyto(self.h_input, chw_float32.ravel())
         self._cuda.memcpy_htod_async(self.d_input, self.h_input, self.stream)
 
