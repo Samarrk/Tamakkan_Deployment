@@ -86,7 +86,7 @@ def run_benchmark(video_path: str, label: str):
     t_load_start = time.perf_counter()
     pipeline = TamakkanPipeline(
         yolo_weights=pick("best.engine", "best.pt"),
-        bytetrack_yaml=str(weights_dir / "bytetrack_tamakkan.yaml"),
+        bytetrack_config=str(weights_dir / "bytetrack_tamakkan.yaml"),
         depth_weights=pick("depth_anything_v2_vits.engine", "depth_anything_v2_vits.pth"),
         lane_weights=pick("culane_res18_v2.engine", "culane_res18_v2.pth"),
         device="cuda:0",
