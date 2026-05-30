@@ -149,8 +149,8 @@ def run_benchmark(video_path: str, label: str):
                 stage_times[stage].append(ms)
 
         # Collect events
-        if hasattr(result, "events") and result.events:
-            for ev in result.events:
+        if hasattr(result, "session_events") and result.session_events:
+            for ev in result.session_events:
                 events.append({
                     "frame": frame_idx,
                     "type": getattr(ev, "event_type", "unknown"),
